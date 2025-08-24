@@ -1,34 +1,44 @@
 import os
 import threading
 import time
-from pyrogram import Client
-from pyrogram import filters
+from fastapi import FastAPI
+import uvicorn
+from pyrogram import Client, filters
 import pyrogram
 
-
-# setup
+# Env setup
 bot_token = os.environ.get("TOKEN", "") 
 api_hash = os.environ.get("HASH", "") 
 api_id = os.environ.get("ID", "") 
-app = Client("my_bot",api_id=api_id, api_hash=api_hash,bot_token=bot_token)
+app = Client("my_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
+
+# Make ffmpeg executable
 os.system("chmod 777 ./ffmpeg/ffmpeg")
 
+# ========== HEALTH CHECK SERVER FOR KOYEB ==========
+health_app = FastAPI()
 
-# start command
+@health_app.get("/")
+def read_root():
+    return {"status": "ok"}
+
+def run_health_server():
+    uvicorn.run(health_app, host="0.0.0.0", port=8080)
+
+# Start FastAPI health server in background
+threading.Thread(target=run_health_server, daemon=True).start()
+# =====================================================
+
 @app.on_message(filters.command(['start']))
-def echo(client, message : pyrogram.types.messages_and_media.message.Message):
-    app.send_message(message.chat.id,f"**Welcome** {message.from_user.mention}\n__just to send me a Video file__")
+def echo(client, message: pyrogram.types.messages_and_media.message.Message):
+    app.send_message(message.chat.id, f"**Welcome** {message.from_user.mention}\n__just send me a Video file__")
 
 
-# upload status
-def upstatus(statusfile,message):
-    while True:
-        if os.path.exists(statusfile):
-            break
-
-    time.sleep(3)      
+def upstatus(statusfile, message):
+    while not os.path.exists(statusfile):
+        time.sleep(3)
     while os.path.exists(statusfile):
-        with open(statusfile,"r") as upread:
+        with open(statusfile, "r") as upread:
             txt = upread.read()
         try:
             app.edit_message_text(message.chat.id, message.id, f"__Uploaded__ : **{txt}**")
@@ -37,15 +47,11 @@ def upstatus(statusfile,message):
             time.sleep(5)
 
 
-# download status
-def downstatus(statusfile,message):
-    while True:
-        if os.path.exists(statusfile):
-            break
-
-    time.sleep(3)      
+def downstatus(statusfile, message):
+    while not os.path.exists(statusfile):
+        time.sleep(3)
     while os.path.exists(statusfile):
-        with open(statusfile,"r") as upread:
+        with open(statusfile, "r") as upread:
             txt = upread.read()
         try:
             app.edit_message_text(message.chat.id, message.id, f"__Downloaded__ : **{txt}**")
@@ -54,69 +60,61 @@ def downstatus(statusfile,message):
             time.sleep(5)
 
 
-# progress writter
 def progress(current, total, message, type):
-    with open(f'{message.id}{type}status.txt',"w") as fileup:
+    with open(f'{message.id}{type}status.txt', "w") as fileup:
         fileup.write(f"{current * 100 / total:.1f}%")
 
 
-# compress
-def compress(message,msg):
+def compress(message, msg):
+    threading.Thread(target=lambda: downstatus(f'{message.id}downstatus.txt', msg), daemon=True).start()
+    vfile = app.download_media(message, progress=progress, progress_args=[message, "down"])
 
-    dowsta = threading.Thread(target=lambda:downstatus(f'{message.id}downstatus.txt',msg),daemon=True)
-    dowsta.start()
-    vfile = app.download_media(message, progress=progress, progress_args=[message,"down"])
     if os.path.exists(f'{message.id}downstatus.txt'):
         os.remove(f'{message.id}downstatus.txt')
 
     name = vfile.split("/")[-1]
-    cmd = f'./ffmpeg/ffmpeg -i {vfile} -c:v libx265 -vtag hvc1 output-{message.id}.mkv'
-    app.edit_message_text(message.chat.id, msg.id, "__Compressing__") 
+    output_file = f'output-{message.id}.mkv'
+    cmd = f'./ffmpeg/ffmpeg -i "{vfile}" -c:v libx265 -vtag hvc1 "{output_file}"'
+
+    app.edit_message_text(message.chat.id, msg.id, "__Compressing__")
     try:
         os.system(cmd)
     except:
-        app.edit_message_text(message.chat.id, msg.id, "**Error**")
+        app.edit_message_text(message.chat.id, msg.id, "**Compression Error**")
         return
 
-    file_exists = os.path.exists(f'output-{message.id}.mkv')
-    if file_exists:
+    if os.path.exists(output_file):
         os.remove(vfile)
     else:
-        app.edit_message_text(message.chat.id, msg.id, "**Error**")
+        app.edit_message_text(message.chat.id, msg.id, "**Compression Failed**")
         return
 
-    os.rename(f'output-{message.id}.mkv',name)
+    os.rename(output_file, name)
     app.edit_message_text(message.chat.id, msg.id, "__Uploading__")
-    upsta = threading.Thread(target=lambda:upstatus(f'{message.id}upstatus.txt',msg),daemon=True)
-    upsta.start()
-    app.send_document(message.chat.id,document=name, force_document=True, progress=progress, progress_args=[message,"up"], reply_to_message_id=message.id)
+    threading.Thread(target=lambda: upstatus(f'{message.id}upstatus.txt', msg), daemon=True).start()
+    app.send_document(message.chat.id, document=name, force_document=True, progress=progress, progress_args=[message, "up"], reply_to_message_id=message.id)
 
     if os.path.exists(f'{message.id}upstatus.txt'):
         os.remove(f'{message.id}upstatus.txt')
-    app.delete_messages(message.chat.id,[msg.id])      
+    app.delete_messages(message.chat.id, [msg.id])
     os.remove(name)
 
 
-# document
 @app.on_message(filters.document)
-def documnet(client, message):
+def document_handler(client, message):
     try:
-        mimetype = message.document.mime_type
-        if "video" in mimetype:
-            msg = app.send_message(message.chat.id,"__Downloading__", reply_to_message_id=message.id) 
-            comp = threading.Thread(target=lambda:compress(message,msg),daemon=True)
-            comp.start() 
+        if "video" in message.document.mime_type:
+            msg = app.send_message(message.chat.id, "__Downloading__", reply_to_message_id=message.id)
+            threading.Thread(target=lambda: compress(message, msg), daemon=True).start()
     except:
-        app.send_message(message.chat.id,"**Send only Videos**")    
+        app.send_message(message.chat.id, "**Send only Videos**")
 
 
-# video
 @app.on_message(filters.video)
-def video(client, message):
-    msg = app.send_message(message.chat.id,"__Downloading__", reply_to_message_id=message.id)   
-    comp = threading.Thread(target=lambda:compress(message,msg),daemon=True)
-    comp.start()
+def video_handler(client, message):
+    msg = app.send_message(message.chat.id, "__Downloading__", reply_to_message_id=message.id)
+    threading.Thread(target=lambda: compress(message, msg), daemon=True).start()
 
 
-# infinty polling
+# Start the bot
 app.run()
